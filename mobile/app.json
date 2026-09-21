@@ -1,0 +1,35 @@
+{
+  "expo": {
+    "name": "FitSync Gym",
+    "slug": "fitsync-gym",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "backgroundColor": "#0B0F19"
+    },
+    "android": {
+      "package": "com.fitsync.gym",
+      "adaptiveIcon": {
+        "backgroundColor": "#0B0F19"
+      },
+      "permissions": [
+        "INTERNET",
+        "ACCESS_NETWORK_STATE"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-sqlite"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "42711eb6-12a8-4450-affe-4daae48fff02"
+      }
+    },
+    "owner": "cristiandiaz14"
+  }
+}

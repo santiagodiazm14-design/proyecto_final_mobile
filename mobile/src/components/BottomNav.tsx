@@ -11,6 +11,8 @@ interface BottomNavProps {
   onSelectScreen: (screen: ScreenType) => void;
 }
 
+// Barra de navegación inferior: los ítems dependen del rol (Admin ve Gestión +
+// Clases; Cliente ve Agendar + Mis Citas), y siempre está Mi Perfil.
 export const BottomNav: React.FC<BottomNavProps> = ({ currentScreen, onSelectScreen }) => {
   const { user } = useAuth();
   if (!user) return null;

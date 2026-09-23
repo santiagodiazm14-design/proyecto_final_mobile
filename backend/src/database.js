@@ -1,3 +1,5 @@
+// Capa de acceso a datos del backend: crea/migra el esquema SQLite del servidor
+// y siembra datos de demostración. `db` es la conexión única que usa todo server.js.
 const { DatabaseSync } = require('node:sqlite');
 const path = require('path');
 const fs = require('fs');
@@ -5,6 +7,8 @@ const fs = require('fs');
 const dbPath = path.join(__dirname, '..', 'gym_server.db');
 const db = new DatabaseSync(dbPath);
 
+// Crea las tablas si no existen (idempotente) y aplica migraciones simples
+// para bases de datos que ya tenían datos con un esquema anterior.
 function initDatabase() {
   // Activar modo WAL para concurrencia
   db.exec('PRAGMA journal_mode = WAL;');
@@ -23,6 +27,13 @@ function initDatabase() {
       created_at TEXT NOT NULL
     );
   `);
+
+  // Migración: agregar columna is_blocked si la base de datos ya existía sin ella
+  try {
+    db.exec('ALTER TABLE users ADD COLUMN is_blocked INTEGER NOT NULL DEFAULT 0;');
+  } catch (_) {
+    // La columna ya existe, no hacer nada
+  }
 
   // Tabla Clases del Gimnasio
   db.exec(`
@@ -78,6 +89,8 @@ function initDatabase() {
   seedData();
 }
 
+// Inserta usuarios, clases y reservas de ejemplo la primera vez que se levanta
+// el servidor contra una base de datos vacía (no hace nada si ya hay usuarios).
 function seedData() {
   const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get();
   if (userCount.count === 0) {

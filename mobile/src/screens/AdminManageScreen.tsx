@@ -4,33 +4,47 @@ import { MaterialCommunityIcons } from '@expo/vector-icons';
 import { colors } from '../theme/colors';
 import { useAuth } from '../context/AuthContext';
 import { useSync } from '../context/SyncContext';
-import { sqliteService, LocalClass, LocalBooking } from '../database/sqliteService';
+import { sqliteService, LocalClass, LocalBooking, LocalUser } from '../database/sqliteService';
 import { apiService } from '../services/apiService';
+import { syncService } from '../services/syncService';
 
+// Panel de Administrador (Módulo 4): tres pestañas — control de clases
+// (cancelar/reactivar), asistencia/citas (check-in + cancelación puntual de una
+// reserva) y usuarios (bloquear/desbloquear clientes).
 export const AdminManageScreen: React.FC = () => {
   const { user } = useAuth();
   const { isOnline, refreshPendingCount } = useSync();
 
-  const [activeTab, setActiveTab] = useState<'CLASSES' | 'BOOKINGS'>('CLASSES');
+  const [activeTab, setActiveTab] = useState<'CLASSES' | 'BOOKINGS' | 'USERS'>('CLASSES');
   const [classes, setClasses] = useState<LocalClass[]>([]);
   const [bookings, setBookings] = useState<LocalBooking[]>([]);
+  const [users, setUsers] = useState<LocalUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [processingId, setProcessingId] = useState<string | null>(null);
 
+  // Carga las 3 listas desde SQLite (offline-first); si hay red, las refresca con
+  // el servidor y reconcilia el directorio de usuarios en la cache local.
   const loadData = useCallback(async () => {
     try {
       const localClasses = await sqliteService.getClasses();
       const localBookings = await sqliteService.getBookings(); // all bookings for admin
+      const localUsers = await sqliteService.getAllUsers('cliente');
       setClasses(localClasses);
       setBookings(localBookings);
+      setUsers(localUsers);
 
       if (isOnline) {
         try {
           const remoteClasses = await apiService.getClasses();
-          const remoteBookings = await apiService.pullSync();
+          const remoteSync = await apiService.pullSync();
           if (remoteClasses) setClasses(remoteClasses);
-          if (remoteBookings?.bookings) setBookings(remoteBookings.bookings);
+          if (remoteSync?.bookings) setBookings(remoteSync.bookings);
+          if (remoteSync?.users) {
+            await sqliteService.applyRemoteSync(remoteSync.classes || remoteClasses || [], remoteSync.bookings || [], remoteSync.users);
+            const refreshedUsers = await sqliteService.getAllUsers('cliente');
+            setUsers(refreshedUsers);
+          }
         } catch (_) {}
       }
     } catch (err) {
@@ -50,53 +64,54 @@ export const AdminManageScreen: React.FC = () => {
     loadData();
   };
 
+  // Pide confirmación con un modal de 2 botones y ejecuta la acción admin (con estado de procesando + refresco de datos)
+  const confirmAndRun = (
+    id: string,
+    title: string,
+    message: string,
+    confirmText: string,
+    destructive: boolean,
+    run: () => Promise<void>
+  ) => {
+    Alert.alert(title, message, [
+      { text: 'Volver', style: 'cancel' },
+      {
+        text: confirmText,
+        style: destructive ? 'destructive' : 'default',
+        onPress: async () => {
+          setProcessingId(id);
+          try {
+            await run();
+            await refreshPendingCount();
+            await loadData();
+          } catch (e: any) {
+            Alert.alert('Error', e.message);
+          } finally {
+            setProcessingId(null);
+          }
+        }
+      }
+    ]);
+  };
+
   // Administrador: Cancelar o Confirmar Clase del Gimnasio
-  const handleToggleClassStatus = async (gymClass: LocalClass) => {
+  const handleToggleClassStatus = (gymClass: LocalClass) => {
     const nextStatus = gymClass.status === 'CONFIRMADA' ? 'CANCELADA' : 'CONFIRMADA';
     const actionText = nextStatus === 'CANCELADA' ? 'cancelar' : 'confirmar y reactivar';
 
-    Alert.alert(
-      `Confirmar acción`,
+    confirmAndRun(
+      gymClass.id,
+      'Confirmar acción',
       `¿Deseas ${actionText} la sesión "${gymClass.title}"?`,
-      [
-        { text: 'Volver', style: 'cancel' },
-        {
-          text: 'Sí, aplicar',
-          style: nextStatus === 'CANCELADA' ? 'destructive' : 'default',
-          onPress: async () => {
-            setProcessingId(gymClass.id);
-            try {
-              // 1. Modificar en SQLite local
-              await sqliteService.updateClassStatus(gymClass.id, nextStatus);
-
-              // 2. Enviar a API o encolar en sync_queue
-              if (isOnline) {
-                try {
-                  await apiService.updateClassStatus(gymClass.id, nextStatus);
-                } catch {
-                  await sqliteService.enqueueAction('ADMIN_UPDATE_CLASS', 'class', {
-                    classId: gymClass.id,
-                    status: nextStatus
-                  });
-                }
-              } else {
-                await sqliteService.enqueueAction('ADMIN_UPDATE_CLASS', 'class', {
-                  classId: gymClass.id,
-                  status: nextStatus
-                });
-              }
-
-              await refreshPendingCount();
-              await loadData();
-              Alert.alert('Éxito', `La clase ha sido ${nextStatus.toLowerCase()} exitosamente.`);
-            } catch (e: any) {
-              Alert.alert('Error', e.message);
-            } finally {
-              setProcessingId(null);
-            }
-          }
-        }
-      ]
+      'Sí, aplicar',
+      nextStatus === 'CANCELADA',
+      async () => {
+        await sqliteService.updateClassStatus(gymClass.id, nextStatus);
+        await syncService.syncOrQueue(isOnline, 'ADMIN_UPDATE_CLASS', 'class', { classId: gymClass.id, status: nextStatus }, () =>
+          apiService.updateClassStatus(gymClass.id, nextStatus)
+        );
+        Alert.alert('Éxito', `La clase ha sido ${nextStatus.toLowerCase()} exitosamente.`);
+      }
     );
   };
 
@@ -104,26 +119,15 @@ export const AdminManageScreen: React.FC = () => {
   const handleToggleCheckin = async (booking: LocalBooking) => {
     const nextAttended = booking.is_attended ? 0 : 1;
     setProcessingId(booking.id);
-
     try {
       await sqliteService.checkinBooking(booking.id, nextAttended === 1);
-
-      if (isOnline) {
-        try {
-          await apiService.checkinBooking(booking.id, nextAttended === 1);
-        } catch {
-          await sqliteService.enqueueAction('ADMIN_CHECKIN', 'booking', {
-            bookingId: booking.id,
-            attended: nextAttended === 1
-          });
-        }
-      } else {
-        await sqliteService.enqueueAction('ADMIN_CHECKIN', 'booking', {
-          bookingId: booking.id,
-          attended: nextAttended === 1
-        });
-      }
-
+      await syncService.syncOrQueue(
+        isOnline,
+        'ADMIN_CHECKIN',
+        'booking',
+        { bookingId: booking.id, attended: nextAttended === 1 },
+        () => apiService.checkinBooking(booking.id, nextAttended === 1)
+      );
       await refreshPendingCount();
       await loadData();
     } catch (e: any) {
@@ -131,6 +135,46 @@ export const AdminManageScreen: React.FC = () => {
     } finally {
       setProcessingId(null);
     }
+  };
+
+  // Administrador: Cancelar una Cita puntual (sin cancelar toda la clase)
+  const handleAdminCancelBooking = (booking: LocalBooking) => {
+    confirmAndRun(
+      booking.id,
+      'Cancelar Cita',
+      `¿Deseas cancelar la reserva de ${booking.user_name} en "${booking.class_title}"?`,
+      'Sí, cancelar',
+      true,
+      async () => {
+        const reason = 'Cancelada por administración';
+        await sqliteService.cancelBooking(booking.id, reason);
+        await syncService.syncOrQueue(isOnline, 'CANCEL_BOOKING', 'booking', { bookingId: booking.id, reason }, () =>
+          apiService.cancelBooking(booking.id, reason)
+        );
+        Alert.alert('Éxito', 'La cita ha sido cancelada exitosamente.');
+      }
+    );
+  };
+
+  // Administrador: Bloquear / Desbloquear Usuario Cliente
+  const handleToggleUserBlock = (targetUser: LocalUser) => {
+    const nextBlocked = !targetUser.is_blocked;
+    const actionText = nextBlocked ? 'bloquear' : 'desbloquear';
+
+    confirmAndRun(
+      targetUser.id,
+      'Confirmar acción',
+      `¿Deseas ${actionText} a ${targetUser.name}?`,
+      'Sí, aplicar',
+      nextBlocked,
+      async () => {
+        await sqliteService.setUserBlocked(targetUser.id, nextBlocked);
+        await syncService.syncOrQueue(isOnline, 'ADMIN_BLOCK_USER', 'user', { userId: targetUser.id, blocked: nextBlocked }, () =>
+          apiService.updateUserBlock(targetUser.id, nextBlocked)
+        );
+        Alert.alert('Éxito', `Usuario ${nextBlocked ? 'bloqueado' : 'desbloqueado'} exitosamente.`);
+      }
+    );
   };
 
   return (
@@ -174,6 +218,20 @@ export const AdminManageScreen: React.FC = () => {
           />
           <Text style={[styles.tabText, activeTab === 'BOOKINGS' && styles.tabTextActive]}>
             Asistencia / Citas ({bookings.length})
+          </Text>
+        </TouchableOpacity>
+
+        <TouchableOpacity
+          style={[styles.tabButton, activeTab === 'USERS' && styles.tabButtonActive]}
+          onPress={() => setActiveTab('USERS')}
+        >
+          <MaterialCommunityIcons
+            name="account-lock"
+            size={16}
+            color={activeTab === 'USERS' ? colors.primary : colors.textMuted}
+          />
+          <Text style={[styles.tabText, activeTab === 'USERS' && styles.tabTextActive]}>
+            Usuarios ({users.length})
           </Text>
         </TouchableOpacity>
       </View>
@@ -242,7 +300,7 @@ export const AdminManageScreen: React.FC = () => {
             );
           }}
         />
-      ) : (
+      ) : activeTab === 'BOOKINGS' ? (
         /* Pestaña 2: Control de Citas y Asistencia */
         <FlatList
           data={bookings}
@@ -307,6 +365,19 @@ export const AdminManageScreen: React.FC = () => {
                     </TouchableOpacity>
                   </View>
                 )}
+
+                {!isCancelled && (
+                  <View style={styles.cancelBookingRow}>
+                    <TouchableOpacity
+                      style={styles.cancelBookingBtn}
+                      onPress={() => handleAdminCancelBooking(item)}
+                      disabled={isProcessing}
+                    >
+                      <MaterialCommunityIcons name="close-circle-outline" size={14} color={colors.danger} />
+                      <Text style={styles.cancelBookingBtnText}>Cancelar Cita (Admin)</Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
               </View>
             );
           }}
@@ -314,6 +385,67 @@ export const AdminManageScreen: React.FC = () => {
             <View style={styles.emptyContainer}>
               <MaterialCommunityIcons name="calendar-blank" size={36} color={colors.textSubtle} />
               <Text style={styles.emptyText}>No hay reservas registradas en el sistema.</Text>
+            </View>
+          }
+        />
+      ) : (
+        /* Pestaña 3: Bloqueo de Usuarios */
+        <FlatList
+          data={users}
+          keyExtractor={(item) => item.id}
+          refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.primary} />}
+          contentContainerStyle={styles.listContent}
+          renderItem={({ item }) => {
+            const isBlocked = !!item.is_blocked;
+            const isProcessing = processingId === item.id;
+
+            return (
+              <View style={[styles.bookingAdminCard, isBlocked && styles.adminCardCancelled]}>
+                <View style={styles.cardTop}>
+                  <View style={{ flex: 1 }}>
+                    <Text style={styles.userNameText}>{item.name}</Text>
+                    <Text style={styles.userEmailText}>{item.email}</Text>
+                    <Text style={styles.bookedClassText}>{item.fitness_goal || 'Sin objetivo definido'}</Text>
+                  </View>
+                  <View style={[styles.statusPill, isBlocked ? styles.statusPillDanger : styles.statusPillSuccess]}>
+                    <Text style={[styles.statusPillText, { color: isBlocked ? colors.danger : colors.success }]}>
+                      {isBlocked ? 'BLOQUEADO' : 'ACTIVO'}
+                    </Text>
+                  </View>
+                </View>
+
+                <View style={styles.btnRow}>
+                  <TouchableOpacity
+                    style={[
+                      styles.actionBtn,
+                      isBlocked ? styles.btnReactivate : styles.btnCancelClass
+                    ]}
+                    onPress={() => handleToggleUserBlock(item)}
+                    disabled={isProcessing}
+                  >
+                    {isProcessing ? (
+                      <ActivityIndicator size="small" color={colors.white} />
+                    ) : (
+                      <>
+                        <MaterialCommunityIcons
+                          name={isBlocked ? 'lock-open-variant' : 'lock'}
+                          size={16}
+                          color={colors.white}
+                        />
+                        <Text style={styles.actionBtnText}>
+                          {isBlocked ? 'Desbloquear Usuario' : 'Bloquear Usuario'}
+                        </Text>
+                      </>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </View>
+            );
+          }}
+          ListEmptyComponent={
+            <View style={styles.emptyContainer}>
+              <MaterialCommunityIcons name="account-group-outline" size={36} color={colors.textSubtle} />
+              <Text style={styles.emptyText}>No hay usuarios cliente registrados en el sistema.</Text>
             </View>
           }
         />
@@ -541,6 +673,30 @@ const styles = StyleSheet.create({
   },
   checkinBtnText: {
     color: colors.white,
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  cancelBookingRow: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    marginTop: 8,
+    paddingTop: 8,
+    borderTopWidth: 1,
+    borderTopColor: colors.surfaceBorder,
+  },
+  cancelBookingBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: colors.dangerLight,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: colors.danger,
+  },
+  cancelBookingBtnText: {
+    color: colors.danger,
     fontSize: 11,
     fontWeight: '700',
   },

@@ -6,11 +6,15 @@ import { useAuth } from '../context/AuthContext';
 import { useSync } from '../context/SyncContext';
 import { sqliteService, LocalBooking } from '../database/sqliteService';
 import { apiService } from '../services/apiService';
+import { syncService } from '../services/syncService';
 
 interface MyBookingsScreenProps {
   onGoToClasses: () => void;
 }
 
+// Historial de citas del aprendiz y cancelación (Módulo 5): muestra el estado de
+// cada reserva (confirmada, cancelada por mí, cancelada por el gym, asistida) y
+// permite cancelar con un motivo, liberando el cupo de inmediato.
 export const MyBookingsScreen: React.FC<MyBookingsScreenProps> = ({ onGoToClasses }) => {
   const { user } = useAuth();
   const { isOnline, refreshPendingCount } = useSync();
@@ -31,6 +35,8 @@ export const MyBookingsScreen: React.FC<MyBookingsScreenProps> = ({ onGoToClasse
     'Otro motivo'
   ];
 
+  // Reservas de este usuario: primero desde SQLite local, y si hay red, se
+  // refrescan con lo que devuelva el pull del servidor.
   const loadMyBookings = useCallback(async () => {
     if (!user) return;
     try {
@@ -75,25 +81,17 @@ export const MyBookingsScreen: React.FC<MyBookingsScreenProps> = ({ onGoToClasse
       await sqliteService.cancelBooking(cancellingBooking.id, finalReason);
 
       // 2. Enviar a la API o encolar en sync_queue según conexión
-      if (isOnline) {
-        try {
-          await apiService.cancelBooking(cancellingBooking.id, finalReason);
-          setNotice(`Cita de "${cancellingBooking.class_title}" cancelada exitosamente.`);
-        } catch {
-          await sqliteService.enqueueAction('CANCEL_BOOKING', 'booking', {
-            bookingId: cancellingBooking.id,
-            reason: finalReason
-          });
-          setNotice(`Cancelación registrada en SQLite local (se sincronizará al conectar).`);
-        }
-      } else {
-        // Modo offline
-        await sqliteService.enqueueAction('CANCEL_BOOKING', 'booking', {
-          bookingId: cancellingBooking.id,
-          reason: finalReason
-        });
-        setNotice(`Cancelación realizada en MODO OFFLINE. Guardada en SQLite.`);
-      }
+      const payload = { bookingId: cancellingBooking.id, reason: finalReason };
+      const synced = await syncService.syncOrQueue(isOnline, 'CANCEL_BOOKING', 'booking', payload, () =>
+        apiService.cancelBooking(cancellingBooking.id, finalReason)
+      );
+      setNotice(
+        synced
+          ? `Cita de "${cancellingBooking.class_title}" cancelada exitosamente.`
+          : isOnline
+            ? `Cancelación registrada en SQLite local (se sincronizará al conectar).`
+            : `Cancelación realizada en MODO OFFLINE. Guardada en SQLite.`
+      );
 
       await refreshPendingCount();
       await loadMyBookings();

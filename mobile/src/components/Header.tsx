@@ -5,6 +5,9 @@ import { colors } from '../theme/colors';
 import { useAuth } from '../context/AuthContext';
 import { useSync } from '../context/SyncContext';
 
+// Encabezado fijo de toda la app: marca + usuario logueado, y la barra de estado
+// de red/sincronización (toggle online/offline, contador de pendientes, botón
+// de sync manual y modal para configurar la URL del backend).
 export const Header: React.FC = () => {
   const { user, logout } = useAuth();
   const { isOfflineMode, isOnline, pendingCount, isSyncing, toggleOfflineMode, triggerSync, apiUrl, setApiUrl } = useSync();

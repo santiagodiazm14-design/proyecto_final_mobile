@@ -5,6 +5,8 @@ import { colors } from '../theme/colors';
 import { useAuth } from '../context/AuthContext';
 import { useSync } from '../context/SyncContext';
 
+// Perfil del usuario: datos de la cuenta, panel de estado SQLite/sincronización
+// (mismo estado que expone el Header) y cierre de sesión.
 export const ProfileScreen: React.FC = () => {
   const { user, logout } = useAuth();
   const { isOnline, pendingCount, isOfflineMode, toggleOfflineMode, triggerSync, isSyncing, apiUrl } = useSync();

@@ -6,11 +6,14 @@ import { useAuth } from '../context/AuthContext';
 import { useSync } from '../context/SyncContext';
 import { sqliteService, LocalClass } from '../database/sqliteService';
 import { apiService } from '../services/apiService';
+import { syncService } from '../services/syncService';
 
 interface ClassesScreenProps {
   onGoToMyBookings: () => void;
 }
 
+// Catálogo de clases y agendamiento (Módulo 3): lista las clases con su cupo
+// disponible y permite reservar al instante, online u offline.
 export const ClassesScreen: React.FC<ClassesScreenProps> = ({ onGoToMyBookings }) => {
   const { user } = useAuth();
   const { isOnline, refreshPendingCount } = useSync();
@@ -22,6 +25,8 @@ export const ClassesScreen: React.FC<ClassesScreenProps> = ({ onGoToMyBookings }
   const [bookingClassId, setBookingClassId] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string>('');
 
+  // Muestra primero lo que ya hay en SQLite (instantáneo) y, si hay red, lo
+  // refresca en segundo plano con lo último del servidor.
   const loadClasses = useCallback(async () => {
     try {
       // Siempre cargar primero desde la base de datos local SQLite
@@ -55,6 +60,8 @@ export const ClassesScreen: React.FC<ClassesScreenProps> = ({ onGoToMyBookings }
     loadClasses();
   };
 
+  // Valida cupo/duplicados contra los datos locales, crea la reserva en SQLite
+  // de inmediato y la sincroniza (o encola) según haya conexión.
   const handleBookClass = async (gymClass: LocalClass) => {
     if (!user) return;
     setBookingClassId(gymClass.id);
@@ -103,20 +110,14 @@ export const ClassesScreen: React.FC<ClassesScreenProps> = ({ onGoToMyBookings }
       await sqliteService.createBooking(newBooking);
 
       // 5. Sincronizar o encolar según conectividad
-      if (isOnline) {
-        try {
-          await apiService.createBooking(newBooking);
-          setActionNotice(`¡Reserva confirmada en ${gymClass.title}! (Sincronizada con el servidor)`);
-        } catch (apiErr) {
-          // Si falló el envío online, encolar en SQLite
-          await sqliteService.enqueueAction('BOOK_CLASS', 'booking', newBooking);
-          setActionNotice(`¡Reserva guardada en SQLite local! (Se sincronizará al reconectar)`);
-        }
-      } else {
-        // En modo offline: encolar en SQLite sync_queue
-        await sqliteService.enqueueAction('BOOK_CLASS', 'booking', newBooking);
-        setActionNotice(`¡Reserva agendada OFFLINE! Guardada en SQLite local.`);
-      }
+      const synced = await syncService.syncOrQueue(isOnline, 'BOOK_CLASS', 'booking', newBooking, () => apiService.createBooking(newBooking));
+      setActionNotice(
+        synced
+          ? `¡Reserva confirmada en ${gymClass.title}! (Sincronizada con el servidor)`
+          : isOnline
+            ? `¡Reserva guardada en SQLite local! (Se sincronizará al reconectar)`
+            : `¡Reserva agendada OFFLINE! Guardada en SQLite local.`
+      );
 
       await refreshPendingCount();
       await loadClasses();

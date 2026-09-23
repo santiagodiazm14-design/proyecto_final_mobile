@@ -9,6 +9,8 @@ interface LoginScreenProps {
   onGoToRegister: () => void;
 }
 
+// Pantalla de login (Módulo 1): formulario con email/contraseña + botones de
+// "acceso rápido" para entrar como Admin o Cliente demo sin escribir nada.
 export const LoginScreen: React.FC<LoginScreenProps> = ({ onGoToRegister }) => {
   const { login, quickLogin, isLoading } = useAuth();
   const { isOnline } = useSync();

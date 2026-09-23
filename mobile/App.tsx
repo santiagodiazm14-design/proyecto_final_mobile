@@ -13,12 +13,16 @@ import { AdminManageScreen } from './src/screens/AdminManageScreen';
 import { MyBookingsScreen } from './src/screens/MyBookingsScreen';
 import { ProfileScreen } from './src/screens/ProfileScreen';
 
+// Navegación raíz de la app (sin librería de routing): decide entre pantallas
+// de autenticación y las pantallas internas según haya o no un usuario logueado,
+// y cuál pestaña del BottomNav está activa.
 const MainNavigator: React.FC = () => {
   const { user } = useAuth();
   const [authView, setAuthView] = useState<'LOGIN' | 'REGISTER'>('LOGIN');
   const [currentScreen, setCurrentScreen] = useState<ScreenType>('CLASSES');
 
-  // Si no está autenticado, mostrar Login o Registro
+  // Login obligatorio: sin sesión (AuthContext nunca autologuea) solo se puede
+  // ver Login o Registro, sin importar el rol que se vaya a usar después.
   if (!user) {
     if (authView === 'REGISTER') {
       return <RegisterScreen onGoToLogin={() => setAuthView('LOGIN')} />;
@@ -51,10 +55,13 @@ const MainNavigator: React.FC = () => {
   );
 };
 
+// Adapta la firma de LoginScreen (espera onGoToRegister) a como se usa arriba.
 const RegisterScreenPropsWrapper: React.FC<{ onGoToRegister: () => void }> = ({ onGoToRegister }) => {
   return <LoginScreen onGoToRegister={onGoToRegister} />;
 };
 
+// Punto de entrada: AuthProvider va afuera porque SyncProvider necesita leer el
+// usuario logueado (para el auto-sync al reconectar).
 export default function App() {
   return (
     <AuthProvider>

@@ -1,17 +1,45 @@
+// Cliente HTTP hacia el backend Express: un método por endpoint, todos devuelven
+// el JSON ya parseado o lanzan un Error con el mensaje que mandó la API.
+// syncService y las pantallas lo usan solo cuando hay conexión; si falla o está
+// offline, quien llama decide encolar la acción en sqliteService.
 import { Platform } from 'react-native';
+import Constants from 'expo-constants';
+
+const BACKEND_PORT = 3000;
+
+// Detecta la IP LAN de la máquina que corre `expo start` (Metro), que es la misma
+// que corre el backend en este proyecto. Evita depender de una IP fija hardcodeada.
+function detectLanHost(): string | null {
+  const hostUri =
+    (Constants.expoConfig as any)?.hostUri ||
+    (Constants as any).expoGoConfig?.debuggerHost ||
+    (Constants as any).manifest2?.extra?.expoClient?.hostUri ||
+    (Constants as any).manifest?.debuggerHost ||
+    null;
+
+  if (!hostUri) return null;
+  const host = String(hostUri).split(':')[0].split('/')[0];
+  return host || null;
+}
 
 class ApiService {
   private baseUrl: string = '';
 
   constructor() {
-    // Configuración automática de la IP del backend según la plataforma
     if (Platform.OS === 'web') {
       this.baseUrl = 'http://localhost:3000/api';
+      return;
+    }
+
+    const lanHost = detectLanHost();
+    if (lanHost) {
+      // Dispositivo físico o emulador: misma IP LAN que usa el bundler de Expo.
+      this.baseUrl = `http://${lanHost}:${BACKEND_PORT}/api`;
     } else if (Platform.OS === 'android') {
-      // 10.0.2.2 para emulador Android, o IP local 10.15.10.39 para dispositivo físico Expo Go
-      this.baseUrl = 'http://10.0.2.2:3000/api';
+      // Fallback: 10.0.2.2 solo funciona dentro del emulador de Android.
+      this.baseUrl = `http://10.0.2.2:${BACKEND_PORT}/api`;
     } else {
-      this.baseUrl = 'http://10.15.10.39:3000/api';
+      this.baseUrl = `http://localhost:${BACKEND_PORT}/api`;
     }
   }
 
@@ -57,6 +85,27 @@ class ApiService {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || 'Error al registrar usuario');
+    return data;
+  }
+
+  // Users: List (Admin)
+  async getUsers(role?: string) {
+    const url = role ? `${this.baseUrl}/users?role=${role}` : `${this.baseUrl}/users`;
+    const res = await fetch(url);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Error al cargar usuarios');
+    return data;
+  }
+
+  // Users: Block / Unblock (Admin)
+  async updateUserBlock(userId: string, blocked: boolean) {
+    const res = await fetch(`${this.baseUrl}/users/${userId}/block`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ blocked })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Error al actualizar el usuario');
     return data;
   }
 

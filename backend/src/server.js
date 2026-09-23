@@ -1,3 +1,6 @@
+// API REST del backend FitSync Gym: expone autenticación, catálogo de clases,
+// reservas/citas y el motor de sincronización (push/pull) que consume la app móvil
+// cuando recupera conexión tras operar offline con su SQLite local.
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
@@ -12,7 +15,8 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// Manejador seguro para JSON malformado
+// Manejador seguro para JSON malformado: si express.json() no puede parsear el
+// body de la petición, responde 400 en vez de dejar que el error tumbe el proceso.
 app.use((err, req, res, next) => {
   if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
     return res.status(400).json({ error: 'JSON malformado recibido en la petición' });
@@ -30,7 +34,8 @@ const APK_PATH = path.resolve(__dirname, '../../dist-apk/FitSync-Gimnasio.apk');
 app.use('/dist-apk', express.static(path.resolve(__dirname, '../../dist-apk')));
 app.use('/apk', express.static(path.resolve(__dirname, '../../dist-apk')));
 
-// Función para obtener la IP local de la máquina en la red
+// Obtiene la IP LAN de la máquina (no-loopback, IPv4) para armar la URL de
+// descarga del APK que se muestra en el QR de la página "/".
 function getLocalIP() {
   const interfaces = os.networkInterfaces();
   for (const name of Object.keys(interfaces)) {
@@ -295,10 +300,14 @@ app.post('/api/auth/login', (req, res) => {
       return res.status(400).json({ error: 'Email y contraseña requeridos' });
     }
 
-    const user = db.prepare('SELECT id, name, email, password, role, fitness_goal, membership_status FROM users WHERE LOWER(email) = LOWER(?)').get(email);
-    
+    const user = db.prepare('SELECT id, name, email, password, role, fitness_goal, membership_status, is_blocked FROM users WHERE LOWER(email) = LOWER(?)').get(email);
+
     if (!user || user.password !== password) {
       return res.status(401).json({ error: 'Credenciales inválidas' });
+    }
+
+    if (user.is_blocked) {
+      return res.status(403).json({ error: 'Tu cuenta ha sido bloqueada por el administrador. Contacta al gimnasio.' });
     }
 
     // No retornar password
@@ -349,6 +358,50 @@ app.post('/api/auth/register', (req, res) => {
   } catch (err) {
     console.error('Error en registro:', err);
     res.status(500).json({ error: 'Error interno al registrar usuario' });
+  }
+});
+
+// Módulo 4: Listar Usuarios (Admin - gestión y bloqueo)
+app.get('/api/users', (req, res) => {
+  try {
+    const { role } = req.query;
+    let query = 'SELECT id, name, email, role, fitness_goal, membership_status, is_blocked, created_at FROM users WHERE 1=1';
+    const params = [];
+
+    if (role) {
+      query += ' AND role = ?';
+      params.push(role);
+    }
+
+    query += ' ORDER BY name ASC';
+    const users = db.prepare(query).all(...params);
+    res.json(users);
+  } catch (err) {
+    console.error('Error al listar usuarios:', err);
+    res.status(500).json({ error: 'Error al consultar usuarios' });
+  }
+});
+
+// Módulo 4: Bloquear / Desbloquear Usuario (Admin)
+app.put('/api/users/:id/block', (req, res) => {
+  try {
+    const { id } = req.params;
+    const { blocked } = req.body;
+
+    const target = db.prepare('SELECT id, role FROM users WHERE id = ?').get(id);
+    if (!target) {
+      return res.status(404).json({ error: 'Usuario no encontrado' });
+    }
+    if (target.role === 'admin') {
+      return res.status(400).json({ error: 'No se puede bloquear a un usuario administrador' });
+    }
+
+    db.prepare('UPDATE users SET is_blocked = ? WHERE id = ?').run(blocked ? 1 : 0, id);
+
+    res.json({ message: `Usuario ${blocked ? 'bloqueado' : 'desbloqueado'} exitosamente`, id, is_blocked: blocked ? 1 : 0 });
+  } catch (err) {
+    console.error('Error al actualizar bloqueo de usuario:', err);
+    res.status(500).json({ error: 'Error al actualizar el estado del usuario' });
   }
 });
 
@@ -591,7 +644,11 @@ app.put('/api/bookings/:id/checkin', (req, res) => {
 
 // 6. MOTOR DE SINCRONIZACIÓN OFFLINE-FIRST: PUSH & PULL
 
-// POST /api/sync/push: Procesa operaciones generadas en el dispositivo móvil mientras estaba offline
+// POST /api/sync/push: recibe el lote de mutaciones que el celular encoló en su
+// tabla `sync_queue` mientras estuvo offline y las aplica una por una contra la
+// base de datos del servidor. Cada mutación responde con su propio status
+// (SUCCESS/ERROR/IGNORED) para que el cliente sepa cuáles puede borrar de su cola
+// y cuáles debe reintentar en la próxima sincronización.
 app.post('/api/sync/push', (req, res) => {
   try {
     const { mutations, clientId = 'mobile-app' } = req.body;
@@ -606,6 +663,8 @@ app.post('/api/sync/push', (req, res) => {
       const { id: queueId, action, entity, payload } = item;
       try {
         switch (action) {
+          // Reserva creada offline: solo la inserta si la clase existe y esa
+          // reserva todavía no llegó al servidor (evita duplicados en reintentos).
           case 'BOOK_CLASS': {
             const { id, user_id, class_id, user_name, user_email, notes } = payload;
             const gymClass = db.prepare('SELECT * FROM gym_classes WHERE id = ?').get(class_id);
@@ -625,11 +684,13 @@ app.post('/api/sync/push', (req, res) => {
             break;
           }
 
+          // Cancelación de cita hecha offline (por el cliente o por el admin):
+          // idempotente, si ya estaba cancelada no hace nada más que responder SUCCESS.
           case 'CANCEL_BOOKING': {
             const { bookingId, reason } = payload;
             const booking = db.prepare('SELECT * FROM bookings WHERE id = ?').get(bookingId);
             if (booking && booking.status !== 'CANCELADA') {
-              db.prepare('UPDATE bookings SET status = "CANCELADA", notes = ?, updated_at = ? WHERE id = ?')
+              db.prepare("UPDATE bookings SET status = 'CANCELADA', notes = ?, updated_at = ? WHERE id = ?")
                 .run(`Motivo: ${reason || 'Cancelación offline'}`, now, bookingId);
               db.prepare('UPDATE gym_classes SET booked_count = MAX(0, booked_count - 1), updated_at = ? WHERE id = ?')
                 .run(now, booking.class_id);
@@ -638,17 +699,20 @@ app.post('/api/sync/push', (req, res) => {
             break;
           }
 
+          // Cancelar/reactivar una clase completa hecha offline por el admin;
+          // si la clase se cancela, arrastra la cancelación a sus reservas activas.
           case 'ADMIN_UPDATE_CLASS': {
             const { classId, status } = payload;
             db.prepare('UPDATE gym_classes SET status = ?, updated_at = ? WHERE id = ?').run(status, now, classId);
             if (status === 'CANCELADA') {
-              db.prepare('UPDATE bookings SET status = "CANCELADA_POR_GIMNASIO", updated_at = ? WHERE class_id = ? AND status = "CONFIRMADA"')
+              db.prepare("UPDATE bookings SET status = 'CANCELADA_POR_GIMNASIO', updated_at = ? WHERE class_id = ? AND status = 'CONFIRMADA'")
                 .run(now, classId);
             }
             results.push({ queueId, status: 'SUCCESS' });
             break;
           }
 
+          // Check-in/asistencia marcada offline por el admin.
           case 'ADMIN_CHECKIN': {
             const { bookingId, attended } = payload;
             db.prepare('UPDATE bookings SET is_attended = ?, updated_at = ? WHERE id = ?').run(attended ? 1 : 0, now, bookingId);
@@ -656,6 +720,20 @@ app.post('/api/sync/push', (req, res) => {
             break;
           }
 
+          // Bloqueo/desbloqueo de un usuario cliente hecho offline por el admin;
+          // nunca bloquea cuentas admin, aunque el cliente lo haya pedido.
+          case 'ADMIN_BLOCK_USER': {
+            const { userId, blocked } = payload;
+            const target = db.prepare('SELECT id, role FROM users WHERE id = ?').get(userId);
+            if (target && target.role !== 'admin') {
+              db.prepare('UPDATE users SET is_blocked = ? WHERE id = ?').run(blocked ? 1 : 0, userId);
+            }
+            results.push({ queueId, status: 'SUCCESS' });
+            break;
+          }
+
+          // Registro de usuario nuevo hecho offline; se ignora si el correo ya existe
+          // (por ejemplo, si otro dispositivo ya lo registró antes de este sync).
           case 'REGISTER_USER': {
             const { id, name, email, password, role, fitness_goal } = payload;
             const exists = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)').get(email);
@@ -697,7 +775,9 @@ app.post('/api/sync/push', (req, res) => {
   }
 });
 
-// GET /api/sync/pull: Devuelve el estado actual de los datos del servidor para que el cliente actualice su SQLite local
+// GET /api/sync/pull: devuelve el estado fresco de clases, reservas (filtradas por
+// user_id si se manda) y usuarios, para que el cliente reconcilie su SQLite local
+// después de aplicar sus mutaciones pendientes.
 app.get('/api/sync/pull', (req, res) => {
   try {
     const { user_id } = req.query;
@@ -718,10 +798,17 @@ app.get('/api/sync/pull', (req, res) => {
 
     const bookings = db.prepare(bookingsQuery).all(...params);
 
+    const users = db.prepare(`
+      SELECT id, name, email, role, fitness_goal, membership_status, is_blocked, created_at
+      FROM users
+      ORDER BY name ASC
+    `).all();
+
     res.json({
       timestamp: new Date().toISOString(),
       classes,
-      bookings
+      bookings,
+      users
     });
   } catch (err) {
     console.error('Error en sync pull:', err);
@@ -729,6 +816,8 @@ app.get('/api/sync/pull', (req, res) => {
   }
 });
 
+// Escucha en 0.0.0.0 (no solo localhost) para que dispositivos físicos en la
+// misma red Wi-Fi puedan llegar a la API usando la IP LAN de esta máquina.
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`=========================================`);
   console.log(`  FitSync Gym Backend API Activa 🏋️`);

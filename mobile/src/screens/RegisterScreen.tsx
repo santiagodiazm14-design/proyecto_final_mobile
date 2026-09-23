@@ -9,6 +9,8 @@ interface RegisterScreenProps {
   onGoToLogin: () => void;
 }
 
+// Pantalla de registro (Módulo 2): nombre, correo, contraseña, rol y objetivo de
+// entrenamiento. Funciona online (API) y offline (SQLite + cola de sync).
 export const RegisterScreen: React.FC<RegisterScreenProps> = ({ onGoToLogin }) => {
   const { register, isLoading } = useAuth();
   const { isOnline } = useSync();
@@ -28,6 +30,8 @@ export const RegisterScreen: React.FC<RegisterScreenProps> = ({ onGoToLogin }) =
     'Salud y Flexibilidad'
   ];
 
+  // Valida campos obligatorios y delega en AuthContext.register (que decide
+  // online/offline); si quedó encolado, muestra el aviso que devuelve el context.
   const handleRegister = async () => {
     if (!name.trim() || !email.trim() || !password.trim()) {
       setErrorMessage('Todos los campos son obligatorios');

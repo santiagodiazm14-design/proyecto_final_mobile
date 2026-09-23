@@ -1,3 +1,7 @@
+// Orquesta la sincronización offline-first: decide si hay conexión, sube la cola
+// pendiente de sqliteService contra la API y trae datos frescos del servidor para
+// reconciliar el SQLite local. Lo consume SyncContext (botón manual + auto-sync
+// al reconectar) y cada pantalla a través de `syncOrQueue`.
 import { sqliteService, SyncQueueItem } from '../database/sqliteService';
 import { apiService } from './apiService';
 
@@ -22,9 +26,35 @@ class SyncService {
     return this.isSimulatedOffline;
   }
 
+  // true si hay conexión real a la API, salvo que el usuario haya activado el
+  // "Modo Offline" simulado desde el Header/Perfil (siempre gana el modo simulado).
   async isOnline(): Promise<boolean> {
     if (this.isSimulatedOffline) return false;
     return await apiService.checkHealth();
+  }
+
+  // Ejecuta una acción contra la API si hay conexión; si falla o está offline,
+  // la encola en SQLite para reintentarla en la próxima sincronización.
+  // Centraliza el patrón "online -> intentar API, si no -> encolar" usado en
+  // reservas, cancelaciones, check-in, gestión de clases y bloqueo de usuarios.
+  // Devuelve true si se aplicó de inmediato contra la API, false si quedó encolada.
+  async syncOrQueue(
+    isOnline: boolean,
+    action: SyncQueueItem['action'],
+    entity: string,
+    payload: any,
+    onlineCall: () => Promise<any>
+  ): Promise<boolean> {
+    if (isOnline) {
+      try {
+        await onlineCall();
+        return true;
+      } catch {
+        // Sigue al encolado para reintentar cuando vuelva la conexión
+      }
+    }
+    await sqliteService.enqueueAction(action, entity, payload);
+    return false;
   }
 
   // Realizar sincronización bidireccional completa
@@ -62,17 +92,26 @@ class SyncService {
         console.log(`Enviando ${pendingQueue.length} mutaciones locales a la API...`);
         const pushResult = await apiService.pushSync(pendingQueue);
 
-        // Si fue exitoso, limpiar o marcar como sincronizadas
+        // Solo marcar como sincronizadas las mutaciones que el servidor aplicó con éxito.
+        // Las que fallaron (ERROR/IGNORED) quedan en la cola para reintentarse en el próximo sync.
+        const resultByQueueId = new Map<string, string>(
+          (pushResult?.results || []).map((r: any) => [r.queueId, r.status])
+        );
+
         for (const item of pendingQueue) {
-          await sqliteService.markQueueItemSynced(item.id);
-          pushedCount++;
+          if (resultByQueueId.get(item.id) === 'SUCCESS') {
+            await sqliteService.markQueueItemSynced(item.id);
+            pushedCount++;
+          } else {
+            console.warn(`Mutación ${item.id} (${item.action}) no se sincronizó, se reintentará: ${resultByQueueId.get(item.id) || 'sin respuesta'}`);
+          }
         }
       }
 
       // 2. PULL: Traer datos frescos del servidor
       const pullResult = await apiService.pullSync(userId);
       if (pullResult && pullResult.classes) {
-        await sqliteService.applyRemoteSync(pullResult.classes, pullResult.bookings || []);
+        await sqliteService.applyRemoteSync(pullResult.classes, pullResult.bookings || [], pullResult.users || []);
       }
 
       const result: SyncStatusResult = {

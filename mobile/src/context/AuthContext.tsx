@@ -1,3 +1,6 @@
+// Contexto de sesión: guarda el usuario logueado en memoria (React state, no
+// persistido entre reinicios de la app a propósito, para que el login sea
+// siempre obligatorio) y resuelve login/registro tanto online como offline.
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { sqliteService, LocalUser } from '../database/sqliteService';
 import { apiService } from '../services/apiService';
@@ -24,12 +27,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const initAuth = async () => {
     try {
+      // Solo precalienta la base local; el login siempre debe ser explícito.
       await sqliteService.init();
-      // Por defecto sesión demo de aprendiz para agilidad
-      const defaultUser = await sqliteService.getUser('cliente@fitsync.com');
-      if (defaultUser) {
-        setUser(defaultUser);
-      }
     } catch (e) {
       console.error('Error inicializando auth:', e);
     } finally {
@@ -37,6 +36,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
+  // Intenta login contra la API; si no hay conexión (o falla la petición), cae al
+  // SQLite local. En ambos casos rechaza a los usuarios marcados como bloqueados.
   const login = async (email: string, pass: string): Promise<{ success: boolean; message?: string }> => {
     setIsLoading(true);
     const isOnline = await syncService.isOnline();
@@ -60,6 +61,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       } else {
         // Modo offline: validar contra SQLite local
         const localUser = await sqliteService.getUser(email);
+        if (localUser && localUser.is_blocked) {
+          return { success: false, message: 'Tu cuenta fue bloqueada por el administrador.' };
+        }
         if (localUser && localUser.password === pass) {
           setUser(localUser);
           return { success: true };
@@ -72,6 +76,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     } catch (err: any) {
       // Fallback a SQLite local si falló conexión
       const localUser = await sqliteService.getUser(email);
+      if (localUser && localUser.is_blocked) {
+        return { success: false, message: 'Tu cuenta fue bloqueada por el administrador.' };
+      }
       if (localUser && localUser.password === pass) {
         setUser(localUser);
         return { success: true };
@@ -82,6 +89,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
+  // Crea la cuenta siempre en SQLite local primero (para poder loguearse ya mismo,
+  // incluso offline), y la manda a la API o la encola según haya conexión.
   const register = async (data: { name: string; email: string; pass: string; role: 'admin' | 'cliente'; fitness_goal?: string }): Promise<{ success: boolean; message?: string }> => {
     setIsLoading(true);
     const userId = `usr-${Date.now()}`;
@@ -101,27 +110,10 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Guardar siempre en SQLite local
       await sqliteService.saveUser(newUser);
 
-      if (isOnline) {
-        // Si está online, enviar directo a la API
-        await apiService.register({
-          id: userId,
-          name: data.name,
-          email: data.email,
-          password: data.pass,
-          role: data.role,
-          fitness_goal: data.fitness_goal
-        });
-      } else {
-        // Si está offline, encolar en SQLite sync_queue
-        await sqliteService.enqueueAction('REGISTER_USER', 'user', {
-          id: userId,
-          name: data.name,
-          email: data.email,
-          password: data.pass,
-          role: data.role,
-          fitness_goal: data.fitness_goal
-        });
-      }
+      // Enviar a la API si hay conexión; si no, encolar en sync_queue
+      await syncService.syncOrQueue(isOnline, 'REGISTER_USER', 'user', newUser, () =>
+        apiService.register({ ...newUser, password: data.pass })
+      );
 
       setUser(newUser);
       return { success: true };
@@ -139,6 +131,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setUser(null);
   };
 
+  // Botones de "acceso rápido" del Login: hacen un login real con las cuentas demo.
   const quickLogin = async (role: 'admin' | 'cliente') => {
     if (role === 'admin') {
       await login('admin@fitsync.com', 'admin123');
